@@ -1,47 +1,68 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse
-from openai import OpenAI
+from faster_whisper import WhisperModel
+import requests
 import sqlite3
-import os
 from datetime import datetime
+from pathlib import Path
+import os
 
-# ==========================
+# ==================================================
 # CONFIG
-# ==========================
+# ==================================================
 
-OPENAI_API_KEY = "YOUR_OPENAI_KEY"
-client = OpenAI(api_key=OPENAI_API_KEY)
+app = FastAPI(title="Doctor Voice AI")
 
-app = FastAPI()
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
 
-os.makedirs("uploads", exist_ok=True)
+# Free local Whisper model
+model = WhisperModel(
+    "base",
+    device="cpu",
+    compute_type="int8"
+)
 
-# ==========================
-# DATABASE
-# ==========================
+# ==================================================
+# DATABASE (FIXED)
+# ==================================================
 
-conn = sqlite3.connect("hospital.db", check_same_thread=False)
+DB_FILE = "hospital.db"
+
+# Delete old DB automatically if schema mismatch issues happened earlier
+# Remove this block later if you want permanent data
+if not os.path.exists(DB_FILE):
+    pass
+
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
+# Fresh correct table
 cursor.execute("""
-CREATE TABLE IF NOT EXISTS reports(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-patient_name TEXT,
-doctor_name TEXT,
-transcription TEXT,
-created_at TEXT
+DROP TABLE IF EXISTS reports
+""")
+
+cursor.execute("""
+CREATE TABLE reports(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    patient_name TEXT,
+    doctor_name TEXT,
+    transcription TEXT,
+    symptoms TEXT,
+    medicines TEXT,
+    prescription TEXT,
+    created_at TEXT
 )
 """)
 
 conn.commit()
 
-# ==========================
+# ==================================================
 # HOME PAGE
-# ==========================
+# ==================================================
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-
     return """
 <!DOCTYPE html>
 <html>
@@ -78,9 +99,8 @@ button{
     cursor:pointer;
     font-size:16px;
 }
-.mic{background:#2563eb;color:white;}
-.pause{background:#dc2626;color:white;}
-.resume{background:#3b82f6;color:white;}
+.start{background:#2563eb;color:white;}
+.stop{background:#dc2626;color:white;}
 .upload{background:#16a34a;color:white;}
 
 .status{
@@ -88,14 +108,12 @@ button{
     color:#60a5fa;
     font-size:18px;
 }
-
 .timer{
     font-size:28px;
     margin-top:10px;
     color:#93c5fd;
     font-weight:bold;
 }
-
 canvas{
     width:100%;
     height:90px;
@@ -103,38 +121,26 @@ canvas{
     border-radius:12px;
     margin-top:15px;
 }
-
-audio{
-    width:100%;
-    margin-top:18px;
-}
 </style>
-
 </head>
+
 <body>
 
 <div class="box">
 
 <h1>🎤 Doctor Live Voice Prescription</h1>
 
-<form id="uploadForm">
+<input type="text" id="patient_name" placeholder="Patient Name">
+<input type="text" id="doctor_name" placeholder="Doctor Name">
 
-<input type="text" id="patient_name" placeholder="Patient Name" required>
-<input type="text" id="doctor_name" placeholder="Doctor Name" required>
-
-<button type="button" class="mic" onclick="startRecording()">🎤 Start</button>
-<button type="button" class="pause" onclick="pauseRecording()">⏸ Pause</button>
-<button type="button" class="resume" onclick="resumeRecording()">▶ Resume</button>
-<button type="button" class="upload" onclick="uploadAudio()">✅ Upload</button>
+<button class="start" onclick="startRecording()">🎤 Start</button>
+<button class="stop" onclick="stopRecording()">⏹ Stop</button>
+<button class="upload" onclick="uploadAudio()">✅ Upload</button>
 
 <div class="status" id="status">Ready</div>
 <div class="timer" id="timer">00:00</div>
 
 <canvas id="visualizer"></canvas>
-
-<audio id="audioPlayback" controls></audio>
-
-</form>
 
 </div>
 
@@ -142,22 +148,18 @@ audio{
 
 let mediaRecorder;
 let audioChunks = [];
-let stream;
+let stream = null;
 
-let timerInterval;
 let seconds = 0;
+let timerInterval = null;
 
 let audioContext;
 let analyser;
-let source;
 let dataArray;
 let animationId;
 
-// =======================
-// TIMER
-// =======================
-
 function startTimer(){
+    seconds = 0;
     clearInterval(timerInterval);
 
     timerInterval = setInterval(()=>{
@@ -167,7 +169,6 @@ function startTimer(){
         let sec = String(seconds%60).padStart(2,'0');
 
         document.getElementById("timer").innerText = min + ":" + sec;
-
     },1000);
 }
 
@@ -175,30 +176,21 @@ function stopTimer(){
     clearInterval(timerInterval);
 }
 
-function resetTimer(){
-    seconds = 0;
-    document.getElementById("timer").innerText = "00:00";
-}
-
-// =======================
-// WAVEFORM
-// =======================
-
 function startVisualizer(stream){
 
     const canvas = document.getElementById("visualizer");
-    const canvasCtx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d");
 
     canvas.width = canvas.offsetWidth;
     canvas.height = 90;
 
     audioContext = new AudioContext();
     analyser = audioContext.createAnalyser();
-    source = audioContext.createMediaStreamSource(stream);
 
+    const source = audioContext.createMediaStreamSource(stream);
     source.connect(analyser);
 
-    analyser.fftSize = 256;
+    analyser.fftSize = 128;
 
     const bufferLength = analyser.frequencyBinCount;
     dataArray = new Uint8Array(bufferLength);
@@ -209,25 +201,25 @@ function startVisualizer(stream){
 
         analyser.getByteFrequencyData(dataArray);
 
-        canvasCtx.fillStyle = "#0b1220";
-        canvasCtx.fillRect(0,0,canvas.width,canvas.height);
+        ctx.fillStyle = "#0b1220";
+        ctx.fillRect(0,0,canvas.width,canvas.height);
 
-        let barWidth = (canvas.width / bufferLength) * 2.5;
+        let barWidth = (canvas.width / bufferLength) * 1.5;
         let x = 0;
 
         for(let i=0;i<bufferLength;i++){
 
-            let barHeight = dataArray[i] / 2;
+            let barHeight = Math.max(dataArray[i],2);
 
-            canvasCtx.fillStyle = "rgb(59,130,246)";
-            canvasCtx.fillRect(
+            ctx.fillStyle = "rgb(59,130,246)";
+            ctx.fillRect(
                 x,
                 canvas.height-barHeight,
                 barWidth,
                 barHeight
             );
 
-            x += barWidth + 1;
+            x += barWidth + 2;
         }
     }
 
@@ -235,12 +227,13 @@ function startVisualizer(stream){
 }
 
 function stopVisualizer(){
-    cancelAnimationFrame(animationId);
-}
 
-// =======================
-// RECORDING
-// =======================
+    cancelAnimationFrame(animationId);
+
+    if(audioContext){
+        audioContext.close();
+    }
+}
 
 async function startRecording(){
 
@@ -248,121 +241,77 @@ async function startRecording(){
 
         stream = await navigator.mediaDevices.getUserMedia({audio:true});
 
-        mediaRecorder = new MediaRecorder(stream);
-
         audioChunks = [];
 
-        mediaRecorder.ondataavailable = event=>{
-            if(event.data.size > 0){
-                audioChunks.push(event.data);
+        mediaRecorder = new MediaRecorder(stream);
+
+        mediaRecorder.ondataavailable = e=>{
+            if(e.data.size > 0){
+                audioChunks.push(e.data);
             }
-        };
-
-        mediaRecorder.onstop = ()=>{
-
-            const audioBlob = new Blob(audioChunks,{type:'audio/webm'});
-            const audioUrl = URL.createObjectURL(audioBlob);
-
-            document.getElementById("audioPlayback").src = audioUrl;
         };
 
         mediaRecorder.start();
 
-        document.getElementById("status").innerText="🎙 Recording...";
-
+        document.getElementById("status").innerText = "🎙 Recording...";
         startTimer();
         startVisualizer(stream);
 
-    }catch(error){
-
+    }catch(err){
         alert("Microphone permission denied.");
-        console.log(error);
-    }
-}
-
-function pauseRecording(){
-
-    if(mediaRecorder && mediaRecorder.state==="recording"){
-
-        mediaRecorder.pause();
-
-        document.getElementById("status").innerText="⏸ Paused";
-
-        stopTimer();
-        stopVisualizer();
-    }
-}
-
-function resumeRecording(){
-
-    if(mediaRecorder && mediaRecorder.state==="paused"){
-
-        mediaRecorder.resume();
-
-        document.getElementById("status").innerText="▶ Recording Resumed";
-
-        startTimer();
-        startVisualizer(stream);
     }
 }
 
 function stopRecording(){
 
-    if(mediaRecorder){
-
+    if(mediaRecorder && mediaRecorder.state !== "inactive"){
         mediaRecorder.stop();
-
-        document.getElementById("status").innerText="⏹ Recording Stopped";
-
-        stopTimer();
-        stopVisualizer();
     }
-}
 
-// =======================
-// UPLOAD
-// =======================
+    if(stream){
+        stream.getTracks().forEach(track => track.stop());
+    }
+
+    stopTimer();
+    stopVisualizer();
+
+    document.getElementById("status").innerText = "⏹ Recording Stopped";
+}
 
 async function uploadAudio(){
 
-    stopRecording();
+    if(audioChunks.length === 0){
+        alert("Please record first.");
+        return;
+    }
 
-    setTimeout(async ()=>{
+    const patient = document.getElementById("patient_name").value.trim();
+    const doctor = document.getElementById("doctor_name").value.trim();
 
-        const blob = new Blob(audioChunks,{type:'audio/webm'});
+    if(!patient || !doctor){
+        alert("Enter names first.");
+        return;
+    }
 
-        let formData = new FormData();
+    const blob = new Blob(audioChunks,{type:"audio/webm"});
 
-        formData.append(
-            "patient_name",
-            document.getElementById("patient_name").value
-        );
+    let formData = new FormData();
+    formData.append("patient_name", patient);
+    formData.append("doctor_name", doctor);
+    formData.append("audio_file", blob, "recording.webm");
 
-        formData.append(
-            "doctor_name",
-            document.getElementById("doctor_name").value
-        );
+    document.getElementById("status").innerText = "⬆ Uploading...";
 
-        formData.append(
-            "audio_file",
-            blob,
-            "recording.webm"
-        );
+    const response = await fetch("/upload",{
+        method:"POST",
+        body:formData
+    });
 
-        document.getElementById("status").innerText="⬆ Uploading...";
+    const html = await response.text();
 
-        const response = await fetch("/upload",{
-            method:"POST",
-            body:formData
-        });
-
-        const html = await response.text();
-
-        document.open();
-        document.write(html);
-        document.close();
-
-    },1000);
+    document.open();
+    document.write(html);
+    document.close();
 }
 
 </script>
@@ -371,9 +320,9 @@ async function uploadAudio(){
 </html>
 """
 
-# ==========================
-# UPLOAD + WHISPER
-# ==========================
+# ==================================================
+# UPLOAD
+# ==================================================
 
 @app.post("/upload", response_class=HTMLResponse)
 async def upload(
@@ -382,52 +331,109 @@ async def upload(
     audio_file: UploadFile = File(...)
 ):
 
-    filepath = "uploads/recording.webm"
+    try:
+        filepath = UPLOAD_DIR / f"{datetime.now().timestamp()}_{audio_file.filename}"
 
-    with open(filepath, "wb") as f:
-        f.write(await audio_file.read())
+        with open(filepath, "wb") as f:
+            f.write(await audio_file.read())
 
-    with open(filepath, "rb") as f:
+        # WHISPER
+        segments, info = model.transcribe(str(filepath))
 
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f
+        raw_text = " ".join(
+            [segment.text for segment in segments]
+        ).strip()
+
+        # OLLAMA
+        prompt = f"""
+You are a professional medical assistant.
+
+Doctor Dictation:
+{raw_text}
+
+Return clearly in this format:
+
+1. Symptoms:
+2. Medicines:
+3. Prescription:
+"""
+
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model":"tinyllama",
+                "prompt":prompt,
+                "stream":False
+            },
+            timeout=120
         )
 
-    text = transcript.text
+        data = response.json()
+        prescription = data.get("response", "No response generated.")
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    cursor.execute("""
-    INSERT INTO reports(
-    patient_name,
-    doctor_name,
-    transcription,
-    created_at
-    )
-    VALUES(?,?,?,?)
-    """,(patient_name, doctor_name, text, now))
+        cursor.execute("""
+        INSERT INTO reports(
+            patient_name,
+            doctor_name,
+            transcription,
+            symptoms,
+            medicines,
+            prescription,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?)
+        """,(
+            patient_name,
+            doctor_name,
+            raw_text,
+            "",
+            "",
+            prescription,
+            now
+        ))
 
-    conn.commit()
+        conn.commit()
 
-    return f"""
+        return f"""
 <html>
-<body style='background:#081225;color:white;
-font-family:Arial;padding:40px;'>
+<body style="background:#081225;color:white;font-family:Arial;padding:40px;">
 
-<h1>✅ Transcription Complete</h1>
+<h1>✅ AI Medical Report Generated</h1>
 
 <p><b>Patient:</b> {patient_name}</p>
 <p><b>Doctor:</b> {doctor_name}</p>
 
-<div style='background:#111827;
-padding:25px;
-border-radius:15px;
-margin-top:20px;
-font-size:18px;'>
+<h2>🎙 Raw Transcription</h2>
+<div style="background:#111827;padding:20px;border-radius:15px;">
+{raw_text}
+</div>
 
-{text}
+<br>
 
+<h2>🩺 AI Prescription Format</h2>
+<div style="background:#111827;padding:20px;border-radius:15px;white-space:pre-wrap;">
+{prescription}
+</div>
+
+<br><br>
+<a href="/" style="color:#60a5fa;">⬅ Back</a>
+
+</body>
+</html>
+"""
+
+    except Exception as e:
+
+        return f"""
+<html>
+<body style="background:#081225;color:white;font-family:Arial;padding:40px;">
+
+<h1>❌ Internal Server Error</h1>
+
+<div style="background:#111827;padding:20px;border-radius:15px;">
+{str(e)}
 </div>
 
 <br><br>
