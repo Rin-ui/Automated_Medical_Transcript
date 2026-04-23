@@ -24,20 +24,14 @@ model = WhisperModel(
 )
 
 # ==================================================
-# DATABASE (FIXED)
+# DATABASE
 # ==================================================
 
 DB_FILE = "hospital.db"
 
-# Delete old DB automatically if schema mismatch issues happened earlier
-# Remove this block later if you want permanent data
-if not os.path.exists(DB_FILE):
-    pass
-
 conn = sqlite3.connect(DB_FILE, check_same_thread=False)
 cursor = conn.cursor()
 
-# Fresh correct table
 cursor.execute("""
 DROP TABLE IF EXISTS reports
 """)
@@ -337,14 +331,20 @@ async def upload(
         with open(filepath, "wb") as f:
             f.write(await audio_file.read())
 
+        # ==========================================
         # WHISPER
+        # ==========================================
+
         segments, info = model.transcribe(str(filepath))
 
         raw_text = " ".join(
             [segment.text for segment in segments]
         ).strip()
 
-        # OLLAMA
+        # ==========================================
+        # GEMMA 2B AI
+        # ==========================================
+
         prompt = f"""
 You are a professional medical assistant.
 
@@ -361,7 +361,7 @@ Return clearly in this format:
         response = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model":"tinyllama",
+                "model":"gemma:2b",
                 "prompt":prompt,
                 "stream":False
             },
@@ -370,6 +370,10 @@ Return clearly in this format:
 
         data = response.json()
         prescription = data.get("response", "No response generated.")
+
+        # ==========================================
+        # SAVE DATABASE
+        # ==========================================
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -443,3 +447,10 @@ Return clearly in this format:
 </body>
 </html>
 """
+
+# ==================================================
+# RUN
+# ollama pull gemma:2b
+# ollama run gemma:2b
+# uvicorn main:app --reload
+# ==================================================
